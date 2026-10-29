@@ -1,0 +1,13 @@
+{
+  "name": "shopify-slack-ops",
+  "version": "1.0.0",
+  "private": true,
+  "description": "n8n workflows that bring a Shopify store's day-to-day ops into Slack: order alerts, low stock, daily digest, abandoned checkouts.",
+  "scripts": {
+    "build": "node build.mjs",
+    "deploy": "node build.mjs --deploy",
+    "test": "node build.mjs && node --test test/core.test.mjs test/workflows.test.mjs",
+    "demo": "node demo.mjs"
+  },
+  "engines": { "node": ">=20" }
+}

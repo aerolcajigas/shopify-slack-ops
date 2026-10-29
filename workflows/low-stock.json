@@ -1,0 +1,146 @@
+{
+  "name": "Shopify Ops / Low Stock",
+  "nodes": [
+    {
+      "id": "54ecf57b-c853-4b45-b9fc-533241f00603",
+      "name": "Every Hour",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "42047755-8009-4c92-aee7-8da4c2a56013",
+      "name": "Get Low Variants",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        260,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "shopifyAccessTokenApi": {
+          "id": "SHOPIFY_CREDENTIAL_ID",
+          "name": "Shopify Access Token"
+        }
+      },
+      "parameters": {
+        "method": "POST",
+        "url": "https://your-store.myshopify.com/admin/api/2026-07/graphql.json",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "shopifyAccessTokenApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: \"query($q: String!) { productVariants(first: 250, query: $q) { nodes { id sku displayName inventoryQuantity product { id title status } } } }\", variables: { q: 'inventory_quantity:<=5' } }) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "385eb66e-8c49-4f32-8665-47becd01737b",
+      "name": "Pick New Alerts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Shopify -> Slack ops logic. Plain JS with no imports: build.mjs pastes this file into the n8n Code nodes, and\n// test/core.test.mjs runs the same functions against sample Shopify payloads. Everything below \"@export\" is\n// stripped from the n8n copy.\n\nconst DEFAULTS = {\n  shop: 'your-store.myshopify.com',\n  storeCountry: 'US',\n  channels: { orders: 'orders', ops: 'ops-alerts', stock: 'inventory', digest: 'daily-numbers', checkouts: 'sales' },\n  highValue: 300,          // order total (shop currency) that counts as high value\n  heavyDiscount: 0.3,      // discount / subtotal at or above this is flagged\n  lowStock: 5,             // alert when a variant has this many or fewer\n  checkoutMinValue: 75,    // abandoned checkouts worth a human follow-up\n  checkoutMinAgeH: 1,      // give the shopper an hour before it counts as abandoned\n  checkoutMaxAgeH: 48,     // older than this is not worth chasing\n  topProducts: 5,\n};\nconst cfgOf = (c) => ({ ...DEFAULTS, ...(c || {}), channels: { ...DEFAULTS.channels, ...((c && c.channels) || {}) } });\n\nconst num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };\nconst round2 = (n) => Math.round(n * 100) / 100;\nfunction money(n, cur) {\n  try { return new Intl.NumberFormat('en-US', { style: 'currency', currency: cur || 'USD' }).format(n); }\n  catch { return `${cur || ''} ${round2(n).toFixed(2)}`.trim(); }\n}\nconst esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst adminUrl = (cfg, path) => `https://${cfg.shop}/admin/${path}`;\nconst gidNum = (gid) => String(gid || '').split('/').pop();\n\n// ---------- 1. Order alerts (orders/create webhook, REST-shaped payload) ----------\n\nfunction classifyOrder(order, c) {\n  const cfg = cfgOf(c);\n  const total = num(order.total_price);\n  const subtotal = num(order.subtotal_price) + num(order.total_discounts);\n  const discountShare = subtotal > 0 ? num(order.total_discounts) / subtotal : 0;\n  const country = (order.shipping_address && order.shipping_address.country_code) || '';\n  const shipping = (order.shipping_lines || []).map((s) => s.title || '').join(' ');\n  const billingCountry = (order.billing_address && order.billing_address.country_code) || '';\n  // orders_count is missing from some API versions' payloads; only trust it when present.\n  const ordersCount = order.customer && order.customer.orders_count != null ? num(order.customer.orders_count) : null;\n  const tags = String((order.customer && order.customer.tags) || '').toLowerCase().split(',').map((t) => t.trim());\n\n  const flags = [];\n  if (total >= cfg.highValue) flags.push('high_value');\n  if (ordersCount === 1) flags.push('first_order');\n  if (tags.includes('vip')) flags.push('vip');\n  if (discountShare >= cfg.heavyDiscount) flags.push('heavy_discount');\n  if (country && country !== cfg.storeCountry) flags.push('international');\n  if (/express|overnight|next[- ]day|priority/i.test(shipping)) flags.push('express');\n  if (order.note && String(order.note).trim()) flags.push('customer_note');\n  if (country && billingCountry && country !== billingCountry) flags.push('address_mismatch');\n\n  // Review = the combinations that usually precede chargebacks: a big first order shipped somewhere other than\n  // the billing country, or a big first order paid with a heavy discount. A person decides, nothing is cancelled.\n  const review = flags.includes('first_order') && flags.includes('high_value')\n    && (flags.includes('address_mismatch') || flags.includes('heavy_discount'));\n  const priority = review ? 'review' : (flags.includes('high_value') || flags.includes('vip') ? 'high' : 'normal');\n  return { flags, priority, total, currency: order.currency || 'USD', discountShare: round2(discountShare), country };\n}\n\nconst FLAG_LABEL = {\n  high_value: ':moneybag: High value', first_order: ':wave: First order', vip: ':star: VIP',\n  heavy_discount: ':label: Heavy discount', international: ':earth_americas: International', express: ':zap: Express shipping',\n  customer_note: ':memo: Has a note', address_mismatch: ':warning: Ship/bill country differ',\n};\n\n// Returns the Slack messages to send (one per channel): [{ channel, text, blocks }].\nfunction orderMessages(order, c) {\n  const cfg = cfgOf(c);\n  const r = classifyOrder(order, cfg);\n  const who = order.customer ? [order.customer.first_name, order.customer.last_name].filter(Boolean).join(' ') : '';\n  const items = (order.line_items || []).slice(0, 6).map((li) => `• ${li.quantity} × ${esc(li.title)}${li.variant_title ? ` (${esc(li.variant_title)})` : ''}`);\n  if ((order.line_items || []).length > 6) items.push(`• +${order.line_items.length - 6} more`);\n  const head = `${r.priority === 'review' ? ':rotating_light: Review' : r.priority === 'high' ? ':tada:' : ':shopping_bags:'} Order ${esc(order.name)} · ${money(r.total, r.currency)}`;\n  const blocks = [\n    { type: 'section', text: { type: 'mrkdwn', text: `*${head}*\\n${esc(who) || 'Guest'}${r.country ? ` · ${r.country}` : ''}` } },\n    { type: 'section', text: { type: 'mrkdwn', text: items.join('\\n') || '_no line items_' } },\n  ];\n  if (r.flags.length) blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: r.flags.map((f) => FLAG_LABEL[f] || f).join('   ') }] });\n  if (order.note) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `> ${esc(order.note).slice(0, 500)}` } });\n  blocks.push({ type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: 'Open in Shopify' }, url: adminUrl(cfg, `orders/${order.id}`) }] });\n\n  const text = `Order ${order.name} ${money(r.total, r.currency)}${r.flags.length ? ' (' + r.flags.join(', ') + ')' : ''}`;\n  const out = [{ channel: cfg.channels.orders, text, blocks }];\n  if (r.priority === 'review') out.push({ channel: cfg.channels.ops, text: `Review before fulfilling: ${text}`, blocks });\n  return out;\n}\n\n// ---------- 2. Low stock (hourly GraphQL productVariants query) ----------\n\n// variants: GraphQL productVariants nodes. alerted: { [variantId]: qtyWhenAlerted } kept in workflow static data.\n// Alerts once when a variant drops to/below the threshold, again only if it sells out, and forgets it after a\n// restock, so the channel doesn't get the same warning every hour.\nfunction lowStock(variants, alerted, c) {\n  const cfg = cfgOf(c);\n  const prev = { ...(alerted || {}) };\n  const next = {}, fresh = [];\n  for (const v of variants || []) {\n    if (v.product && v.product.status && v.product.status !== 'ACTIVE') continue;\n    if (v.inventoryQuantity == null) continue; // not tracked\n    const q = num(v.inventoryQuantity);\n    if (q > cfg.lowStock) continue; // restocked: dropped from `next`, so it can alert again later\n    next[v.id] = q;\n    const before = prev[v.id];\n    if (before === undefined || (q <= 0 && before > 0)) fresh.push({ ...v, inventoryQuantity: q });\n  }\n  fresh.sort((a, b) => a.inventoryQuantity - b.inventoryQuantity);\n  return { fresh, state: next };\n}\n\nfunction lowStockMessage(fresh, c) {\n  const cfg = cfgOf(c);\n  if (!fresh.length) return null;\n  const line = (v) => `${v.inventoryQuantity <= 0 ? ':red_circle: *Sold out*' : `:large_yellow_circle: *${v.inventoryQuantity} left*`} · <${adminUrl(cfg, `products/${gidNum(v.product && v.product.id)}`)}|${esc(v.displayName || (v.product && v.product.title))}>${v.sku ? ` \\`${esc(v.sku)}\\`` : ''}`;\n  const lines = fresh.slice(0, 25).map(line);\n  if (fresh.length > 25) lines.push(`+${fresh.length - 25} more`);\n  return {\n    channel: cfg.channels.stock,\n    text: `${fresh.length} variant${fresh.length === 1 ? '' : 's'} low on stock`,\n    blocks: [\n      { type: 'section', text: { type: 'mrkdwn', text: `*:package: Low stock (≤ ${cfg.lowStock})*` } },\n      { type: 'section', text: { type: 'mrkdwn', text: lines.join('\\n') } },\n    ],\n  };\n}\n\n// ---------- 3. Daily digest (GraphQL orders for yesterday + the day before) ----------\n\n// UTC offset ('-04:00') of an IANA time zone at a given moment, so DST is handled.\nfunction tzOffset(timeZone, at) {\n  const name = new Intl.DateTimeFormat('en-US', { timeZone, timeZoneName: 'longOffset' })\n    .formatToParts(new Date(at)).find((p) => p.type === 'timeZoneName').value; // \"GMT-04:00\" or \"GMT\"\n  return name === 'GMT' ? '+00:00' : name.slice(3);\n}\n\n// The store-local date `daysBack` days before `now`, as { day, query } for the orders search.\nfunction storeDay(now, timeZone, daysBack) {\n  const local = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(now));\n  const d = new Date(`${local}T12:00:00Z`); d.setUTCDate(d.getUTCDate() - daysBack);\n  const day = d.toISOString().slice(0, 10);\n  d.setUTCDate(d.getUTCDate() + 1);\n  const start = localMidnight(day, timeZone), end = localMidnight(d.toISOString().slice(0, 10), timeZone);\n  return { day, start, end, query: `created_at:>='${start}' AND created_at:<'${end}'` };\n}\n\n// The UTC instant of 00:00 local time on `day`. Guess with the midday offset, then re-check the offset at the guess:\n// on a DST-change day midnight and midday have different offsets (and the day is 23 or 25 hours long).\nfunction localMidnight(day, timeZone) {\n  let t = new Date(`${day}T00:00:00${tzOffset(timeZone, `${day}T12:00:00Z`)}`);\n  t = new Date(`${day}T00:00:00${tzOffset(timeZone, t)}`);\n  return t.toISOString();\n}\n\n// day: 'YYYY-MM-DD' in the store's time zone. tzOffset like '-05:00'. Returns the search string for orders(query:).\nfunction dayRange(day, tzOffset) {\n  const start = new Date(`${day}T00:00:00${tzOffset || 'Z'}`);\n  const end = new Date(start.getTime() + 86400000);\n  return { start: start.toISOString(), end: end.toISOString(), query: `created_at:>='${start.toISOString()}' AND created_at:<'${end.toISOString()}'` };\n}\n\nfunction summarize(orders) {\n  let revenue = 0, refunded = 0, units = 0, cancelled = 0, currency = 'USD';\n  const products = {}, customers = new Set();\n  for (const o of orders || []) {\n    if (o.cancelledAt) { cancelled++; continue; }\n    const m = o.totalPriceSet && o.totalPriceSet.shopMoney;\n    revenue += num(m && m.amount); currency = (m && m.currencyCode) || currency;\n    refunded += num(o.totalRefundedSet && o.totalRefundedSet.shopMoney && o.totalRefundedSet.shopMoney.amount);\n    if (o.customer && o.customer.id) customers.add(o.customer.id);\n    for (const li of (o.lineItems && o.lineItems.nodes) || []) {\n      const k = li.title; const p = products[k] || (products[k] = { title: k, units: 0, sales: 0 });\n      p.units += num(li.quantity); units += num(li.quantity);\n      p.sales += num(li.originalTotalSet && li.originalTotalSet.shopMoney && li.originalTotalSet.shopMoney.amount);\n    }\n  }\n  const count = (orders || []).length - cancelled;\n  return {\n    orders: count, revenue: round2(revenue), net: round2(revenue - refunded), refunded: round2(refunded), units, cancelled,\n    aov: count ? round2(revenue / count) : 0, customers: customers.size, currency,\n    top: Object.values(products).sort((a, b) => b.sales - a.sales || b.units - a.units).map((p) => ({ ...p, sales: round2(p.sales) })),\n  };\n}\n\nfunction change(now, before) {\n  if (!before) return now ? 'new' : '';\n  const pct = Math.round(((now - before) / before) * 100);\n  return `${pct >= 0 ? ':arrow_up_small:' : ':arrow_down_small:'} ${Math.abs(pct)}%`;\n}\n\nfunction digestMessage(day, today, prev, c, partial) {\n  const cfg = cfgOf(c);\n  const s = summarize(today), p = summarize(prev);\n  const m = (n) => money(n, s.currency);\n  const field = (label, val, cmp) => ({ type: 'mrkdwn', text: `*${label}*\\n${val}${cmp ? `  ${cmp}` : ''}` });\n  const blocks = [\n    { type: 'header', text: { type: 'plain_text', text: `Sales for ${day}` } },\n    { type: 'section', fields: [\n      field('Revenue', m(s.revenue), change(s.revenue, p.revenue)),\n      field('Orders', String(s.orders), change(s.orders, p.orders)),\n      field('Avg order', m(s.aov), change(s.aov, p.aov)),\n      field('Refunded', m(s.refunded), ''),\n    ] },\n  ];\n  const top = s.top.slice(0, cfg.topProducts);\n  if (top.length) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: '*Top products*\\n' + top.map((t, i) => `${i + 1}. ${esc(t.title)} · ${t.units} sold · ${m(t.sales)}`).join('\\n') } });\n  const notes = [`vs the day before · ${s.customers} customers · ${s.units} units`];\n  if (s.cancelled) notes.push(`${s.cancelled} cancelled (not counted)`);\n  if (partial) notes.push(':warning: over 250 orders, totals cover the first 250');\n  blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: notes.join(' · ') }] });\n  return { channel: cfg.channels.digest, text: `Sales for ${day}: ${m(s.revenue)} from ${s.orders} orders`, blocks, stats: s };\n}\n\n// ---------- 4. Abandoned checkouts (hourly GraphQL abandonedCheckouts) ----------\n\n// Picks checkouts worth a personal follow-up: old enough to be abandoned, not too old, above the value floor, not\n// completed, not already posted. seen: { [checkoutId]: isoPostedAt } in static data, pruned after 7 days.\nfunction pickCheckouts(checkouts, seen, now, c) {\n  const cfg = cfgOf(c);\n  const t = new Date(now || Date.now()).getTime();\n  const state = {};\n  for (const [id, at] of Object.entries(seen || {})) if (t - new Date(at).getTime() < 7 * 86400000) state[id] = at;\n  const picked = [];\n  for (const ch of checkouts || []) {\n    if (ch.completedAt || state[ch.id]) continue;\n    const ageH = (t - new Date(ch.createdAt).getTime()) / 3600000;\n    const value = num(ch.totalPriceSet && ch.totalPriceSet.shopMoney && ch.totalPriceSet.shopMoney.amount);\n    if (ageH < cfg.checkoutMinAgeH || ageH > cfg.checkoutMaxAgeH || value < cfg.checkoutMinValue) continue;\n    picked.push({ ...ch, ageH: Math.round(ageH), value });\n    state[ch.id] = new Date(t).toISOString();\n  }\n  picked.sort((a, b) => b.value - a.value);\n  return { picked, state };\n}\n\nfunction checkoutMessage(picked, c) {\n  const cfg = cfgOf(c);\n  if (!picked.length) return null;\n  const cur = (ch) => (ch.totalPriceSet && ch.totalPriceSet.shopMoney && ch.totalPriceSet.shopMoney.currencyCode) || 'USD';\n  const blocks = [{ type: 'section', text: { type: 'mrkdwn', text: `*:shopping_trolley: ${picked.length} abandoned checkout${picked.length === 1 ? '' : 's'} worth a follow-up*` } }];\n  for (const ch of picked.slice(0, 10)) {\n    const items = ((ch.lineItems && ch.lineItems.nodes) || []).map((li) => `${li.quantity} × ${esc(li.title)}`).join(', ');\n    const name = (ch.customer && ch.customer.displayName) || 'Guest';\n    blocks.push({\n      type: 'section',\n      text: { type: 'mrkdwn', text: `*${money(ch.value, cur(ch))}* · ${esc(name)} · ${ch.ageH}h ago\\n${items || '_no items_'}` },\n      accessory: { type: 'button', text: { type: 'plain_text', text: 'Open checkout' }, url: adminUrl(cfg, `checkouts/${gidNum(ch.id)}`) },\n    });\n  }\n  blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: 'Send the recovery email from Shopify, or reply here with who is taking it.' }] });\n  return { channel: cfg.channels.checkouts, text: `${picked.length} abandoned checkouts to follow up`, blocks };\n}\n\nconst CONFIG = {\"shop\":\"your-store.myshopify.com\",\"storeCountry\":\"US\",\"channels\":{\"orders\":\"orders\",\"ops\":\"ops-alerts\",\"stock\":\"inventory\",\"digest\":\"daily-numbers\",\"checkouts\":\"sales\"},\"highValue\":300,\"heavyDiscount\":0.3,\"lowStock\":5,\"checkoutMinValue\":75,\"checkoutMinAgeH\":1,\"checkoutMaxAgeH\":48,\"topProducts\":5};\n\n// ---- Pick New Alerts ----\nfunction gql(item) {\n  const b = item.json;\n  if (b.errors && b.errors.length) throw new Error('Shopify GraphQL: ' + b.errors.map((e) => e.message).join('; '));\n  if (!b.data) throw new Error('Shopify GraphQL: empty response');\n  return b.data;\n}\n// Remembers what was already posted (workflow static data persists between production runs, not manual tests).\nconst store = $getWorkflowStaticData('global');\nconst r = lowStock(gql($input.first()).productVariants.nodes, store.lowStock, CONFIG);\nstore.lowStock = r.state;\nconst msg = lowStockMessage(r.fresh, CONFIG);\nreturn msg ? [{ json: msg }] : [];\n"
+      }
+    },
+    {
+      "id": "d4379fae-0745-48b9-8100-bffb5e196216",
+      "name": "Post to Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        780,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_CREDENTIAL_ID",
+          "name": "Slack Bot"
+        }
+      },
+      "parameters": {
+        "authentication": "accessToken",
+        "resource": "message",
+        "operation": "post",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "={{ $json.channel }}"
+        },
+        "messageType": "block",
+        "blocksUi": "={{ JSON.stringify({ blocks: $json.blocks }) }}",
+        "text": "={{ $json.text }}",
+        "otherOptions": {
+          "includeLinkToWorkflow": false
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every Hour": {
+      "main": [
+        [
+          {
+            "node": "Get Low Variants",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Low Variants": {
+      "main": [
+        [
+          {
+            "node": "Pick New Alerts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick New Alerts": {
+      "main": [
+        [
+          {
+            "node": "Post to Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/New_York"
+  },
+  "meta": {
+    "notes": "Hourly: variants at or below the threshold -> #inventory, once per drop (again on sell-out, reset on restock)."
+  }
+}

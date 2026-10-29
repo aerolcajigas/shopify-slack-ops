@@ -1,0 +1,25 @@
+{
+  "shop": "your-store.myshopify.com",
+  "apiVersion": "2026-07",
+  "storeCountry": "US",
+  "timeZone": "America/New_York",
+  "digestHour": 8,
+  "channels": {
+    "orders": "orders",
+    "ops": "ops-alerts",
+    "stock": "inventory",
+    "digest": "daily-numbers",
+    "checkouts": "sales"
+  },
+  "highValue": 300,
+  "heavyDiscount": 0.3,
+  "lowStock": 5,
+  "checkoutMinValue": 75,
+  "checkoutMinAgeH": 1,
+  "checkoutMaxAgeH": 48,
+  "topProducts": 5,
+  "credentials": {
+    "shopify": { "id": "SHOPIFY_CREDENTIAL_ID", "name": "Shopify Access Token" },
+    "slack": { "id": "SLACK_CREDENTIAL_ID", "name": "Slack Bot" }
+  }
+}
